@@ -1,0 +1,243 @@
+#addition requirements
+An ingress-nginx Ingress Controller and the cert-manager TLS certificate manager 
+installed into your cluster and configured to issue TLS certificates. 
+To learn how to install and configure an Ingress with cert-manager,
+please consult How to Set Up an Nginx Ingress with Cert-Manager on DigitalOcean Kubernetes.
+
+#after previous steps
+Pushing the Django App Image to Docker Hub
+docker login
+docker tag polls:latest your_dockerhub_username/your_dockerhub_repo_name:latest
+docker push sammy/sammy-django:latest
+
+Step 4 — Setting Up the ConfigMap
+On Kubernetes, configuration variables can be injected using ConfigMaps and Secrets.
+ConfigMaps should be used to store non-confidential configuration information like app settings, 
+and Secrets should be used for sensitive information like API keys and database credentials
+
+mkdir yaml
+cd
+nano polls-configmap.yaml
+then paste
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: polls-config
+data:
+  DJANGO_ALLOWED_HOSTS: "*"
+  STATIC_ENDPOINT_URL: "https://your_space_name.space_region.digitaloceanspaces.com"
+  STATIC_BUCKET_NAME: "your_space_name"
+  DJANGO_LOGLEVEL: "info"
+  DEBUG: "True"
+  DATABASE_ENGINE: "postgresql_psycopg2"
+
+kubectl apply -f polls-configmap.yaml
+
+Step 5 — Setting Up the Secret
+Secret values must be base64-encoded,
+cp ../env ./polls-secrets
+nano polls-secrets
+
+DJANGO_SECRET_KEY=your_secret_key
+DATABASE_NAME=polls
+DATABASE_USERNAME=your_django_db_user
+DATABASE_PASSWORD=your_django_db_user_password
+DATABASE_HOST=your_db_host
+DATABASE_PORT=your_db_port
+STATIC_ACCESS_KEY_ID=your_space_access_key
+STATIC_SECRET_KEY=your_space_access_key_secret
+
+kubectl create secret generic polls-secret --from-env-file=poll-secrets
+kubectl describe secret polls-secret
+
+Step 6 — Rolling Out the Django App Using a Deployment
+nano polls-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: polls-app
+  labels:
+    app: polls
+spec:
+    replicas: 2
+  selector:
+    matchLabels:
+      app: polls
+  template:
+    metadata:
+      labels:
+        app: polls
+    spec:
+      containers:
+        - image: your_dockerhub_username/app_repo_name:latest
+          name: polls
+          envFrom:
+          - secretRef:
+              name: polls-secret
+          - configMapRef:
+              name: polls-config
+          ports:
+            - containerPort: 8000
+              name: gunicorn
+
+kubectl apply -f polls-deployment.yaml
+kubectl get deploy polls-app
+kubectl describe deploy
+kubectl get pod
+
+Step 7 — Allowing External Access using a Service
+nano polls-svc.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: polls
+  labels:
+    app: polls
+spec:
+  type: NodePort
+  selector:
+    app: polls
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+kubectl apply -f polls-svc.yaml
+kubectl get svc polls
+To connect to the service, we need the external IP addresses for our cluster nodes:
+
+kubectl get node -o wide
+
+In your web browser, visit your Polls app using any Node’s external IP address 
+and the NodePort. Given the output above, the app’s URL would be: 
+http://203.0.113.1:32654/polls.
+
+The final step in this tutorial is to secure external traffic to your app using HTTPS
+o do this we’ll use the ingress-nginx Ingress Controller installed in the p
+rerequisites, and create an Ingress object to route external 
+traffic to the polls Kubernetes Service.
+
+Step 8 — Configuring HTTPS Using Nginx Ingress and cert-manager
+
+Kubernetes Ingresses allow you to flexibly route traffic from outside 
+your Kubernetes cluster to Services inside of your cluster. 
+This is accomplished using Ingress objects, which define rules for 
+routing HTTP and HTTPS traffic to Kubernetes Services, and Ingress Controllers, which implement the rules by load balancing traffic and routing 
+it to the appropriate backend Services.
+
+in the prerequisites you installed the ingress-nginx Ingress Controller and cert-manager TLS certificate 
+automation add-on.
+Before continuing with this step, you should delete the echo-ingress Ingress created in the prerequisite tutorial:
+
+kubectl delete ingress echo-ingress
+You should also have created a DNS A record with your_domain.com pointing 
+to the Ingress Load Balancer’s public IP address
+
+nano polls-ingress.yaml
+nano polls-ingress.yaml
+
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: polls-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+spec:
+  tls:
+  - hosts:
+    - your_domain.com
+    secretName: polls-tls
+  rules:
+  - host: your_domain.com
+    http:
+      paths:
+      - backend:
+          serviceName: polls
+          servicePort: 8000
+
+
+We create an Ingress object called polls-ingress and annotate it to instruct 
+the control plane to use the ingress-nginx Ingress Controller and staging ClusterIssuer. We also enable TLS for your_domain.com and store the certificate and private key in a secret called polls-tls. Finally, we define a rule to route traffic
+for the your_domain.com host to the polls Service on port 8000.
+
+kubectl apply -f polls-ingress.yaml
+kubectl describe ingress polls-ingress
+kubectl describe certificate polls-tls
+
+To send a test request, we’ll use wget from the command-line:
+wget -O - http://your_domain.com/polls ==you will get an error
+we’ll use the suggested --no-check-certificate flag to bypass certificate
+ validation:
+
+wget --no-check-certificate -q -O - http://your_domain.com/polls
+
+Now that you’ve successfully tested certificate issuance using the staging 
+ClusterIssuer, you can modify the Ingress to use the production ClusterIssuer.
+
+Open polls-ingress.yaml for editing once again:
+
+nano polls-ingress.yaml
+Modify the cluster-issuer annotation:
+
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: polls-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - your_domain.com
+    secretName: polls-tls
+  rules:
+  - host: your_domain.com
+    http:
+      paths:
+      - backend:
+          serviceName: polls
+          servicePort: 8000
+kubectl apply -f polls-ingress.yaml
+kubectl describe ingress polls-ingress
+
+The above output confirms that the new production certificate 
+was successfully issued 
+and stored in the polls-tls Secret.
+
+Navigate to your_domain.com/polls
+
+In addition, you should see a padlock in the URL bar. Clicking on the padlock will allow you to 
+inspect the Let’s Encrypt certificate details.
+
+As a final cleanup task, you can optionally switch the polls Service type from NodePort 
+to the internal-only ClusterIP type.
+
+nano polls-svc.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: polls
+  labels:
+    app: polls
+spec:
+  type: ClusterIP
+  selector:
+    app: polls
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+kubectl apply -f polls-svc.yaml --force
+kubectl get svc polls
+
+
+
+
+
+
+
+
+
+

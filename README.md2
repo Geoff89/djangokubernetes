@@ -1,0 +1,264 @@
+How To Scale and Secure a Django Application with Docker, Nginx, and Let's Encrypt
+Step 1 — Configuring the First Django Application Server
+Step 2 — Configuring the Second Django Application Server
+Step 3 — Configuring the Nginx Docker container
+Step 4 — Configuring Certbot and Let’s Encrypt Certificate Renewal
+Step 5 — Preventing External Access to Django App Servers
+
+Running your Django application and Nginx proxy inside of Docker containers 
+ensures that these components behave the same way regardless of the environment
+they are deployed into. In addition, containers provide many features 
+that facilitate packaging and configuring your application.
+
+In this tutorial, you’ll horizontally scale a containerized Django and Gunicorn Polls application by provisioning two application servers that will each run a copy of a Django and Gunicorn app container.
+You’ll also enable HTTPS by provisioning and configuring a third proxy server that will run an Nginx reverse proxy container and a Certbot client container. Certbot will provision TLS certificates for Nginx from the Let’s Encrypt certificate authority. This will ensure that your site receives a high security rating from SSL Labs. This proxy server will receive all of your app’s external requests and sit in front of the two upstream Django application servers. Finally, you’ll harden this distributed system by restricting external access to only the proxy server.
+
+Prerequisites
+To follow this tutorial, you will need:
+
+Three Ubuntu 18.04 servers:
+
+Two servers will be application servers, used to run your Django and Gunicorn app.
+One server will be a proxy server, used to run Nginx and Certbot.
+All should have a non-root user with sudo privileges, and an active firewall. For guidance on how to set these up, please see this Initial Server Setup guide.
+
+An A DNS record with your_domain.com pointing to your proxy server’s public IP address
+step 1
+For server one and server 2 follow the guidelines of creating docker file previously
+
+Step 3 — Configuring the Nginx Docker Container
+Nginx is a versatile web server that offers a number of features including reverse proxying, load balancing, and caching. In this tutorial we’ve offloaded Django’s static assets to object storage, so we won’t use Nginx’s caching capabilities. However, we will use Nginx as a reverse proxy to our two backend Django app servers, and distribute incoming requests between them. In addition, Nginx will perform TLS termination and redirection using a TLS certificate provisioned by Certbot. This means that it will force clients to use HTTPS, 
+redirecting incoming HTTP requests to port 443. It will then decrypt HTTPS requests and proxy them to the upstream Django servers
+
+With both Django app servers up and running, we can begin setting up the Nginx proxy server. Log in to your proxy server and create a directory called conf
+mkdir conf
+Create a configuration file called nginx.conf using nano or your favorite editor:
+nano conf/nginx.conf
+
+upstream django {
+    server APP_SERVER_1_IP;
+    server APP_SERVER_2_IP;
+}
+
+server {
+    listen 80 default_server;
+    return 444;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name your_domain.com;
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name your_domain.com;
+
+    # SSL
+    ssl_certificate /etc/letsencrypt/live/your_domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your_domain.com/privkey.pem;
+
+    ssl_session_cache shared:le_nginx_SSL:10m;
+    ssl_session_timeout 1440m;
+    ssl_session_tickets off;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    ssl_ciphers "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
+
+    client_max_body_size 4G;
+    keepalive_timeout 5;
+
+        location / {
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header Host $http_host;
+          proxy_redirect off;
+          proxy_pass http://django;
+        }
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+}
+
+
+You can now use this configuration file to run an Nginx Docker container.
+In this tutorial we’ll use the nginx:1.19.0 image, version 1.19.0 of the official 
+Docker image maintained by Nginx.
+
+When we run the container for the first time, Nginx will throw an error and fail as we haven’t yet provisioned the certificates defined in the configuration file. However, we’ll still run the command to download the Nginx image locally and test that everything else is functioning correctly:
+
+docker run --rm --name nginx -p 80:80 -p 443:443 \
+    -v ~/conf/nginx.conf:/etc/nginx/conf.d/nginx.conf:ro \
+    -v /var/www/html:/var/www/html \
+    nginx:1.19.0
+
+Here we name the container nginx and map the host ports 80 and 443 to the respective container ports. The -v flag mounts the config file into the Nginx container at /etc/nginx/conf.d/nginx.conf, which the Nginx image is preconfigured to load. It is mounted in ro or “read only” mode, so the container cannot modify the file. The web root directory /var/www/html is also mounted into the container. Finally nginx:1.19.0
+ instructs Docker to pull and run the nginx:1.19.0 image from Dockerhub
+
+ Docker will pull and run the image, then Nginx will throw an error when it doesn’t find the configured TLS certificate and secret key. In the next step we’ll provision these using a Dockerized Certbot client and the Let’s Encrypt certificate authority.
+
+ Step 4 — Configuring Certbot and Let’s Encrypt Certificate Renewal
+ Begin by ensuring that you have a DNS A record mapped to the proxy server’s public IP address. Then, on your proxy server, provision a staging version of the certificates using the certbot Docker image
+
+docker run -it --rm -p 80:80 --name certbot \
+         -v "/etc/letsencrypt:/etc/letsencrypt" \
+         -v "/var/lib/letsencrypt:/var/lib/letsencrypt" \
+         certbot/certbot certonly --standalone --staging -d your_domain.com
+
+ This command runs the certbot Docker image in interactive mode, and forwards port 80 on the host to container port 80. It creates and mounts two host directories into the container: /etc/letsencrypt/ and /var/lib/letsencrypt/. certbot is run in standalone mode, without Nginx, and will use the Let’s Encrypt staging servers to perform domain validation.
+
+When prompted, enter your email address and agree to the Terms of Service. If domain validation was successful, you should see the following output
+
+You can inspect the certificate using cat:
+
+sudo cat /etc/letsencrypt/live/your_domain.com/fullchain.pem
+With the TLS certificate provisioned, we can test the Nginx configuration assembled in the previous step:
+
+docker run --rm --name nginx -p 80:80 -p 443:443 \
+    -v ~/conf/nginx.conf:/etc/nginx/conf.d/nginx.conf:ro \
+    -v /etc/letsencrypt:/etc/letsencrypt \
+    -v /var/lib/letsencrypt:/var/lib/letsencrypt \
+    -v /var/www/html:/var/www/html \
+    nginx:1.19.0
+
+Once Nginx is up and running, navigate to http://your_domain.com. You may receive a warning in your browser that the certificate authority is invalid. This is expected as we’ve provisioned staging certificates and not production Let’s Encrypt certificates
+
+Hit CTRL+C in your terminal to quit Nginx, and run the certbot client again, this time omitting the --staging flag:
+
+docker run -it --rm -p 80:80 --name certbot \
+         -v "/etc/letsencrypt:/etc/letsencrypt" \
+         -v "/var/lib/letsencrypt:/var/lib/letsencrypt" \
+         certbot/certbot certonly --standalone -d your_domain.com
+
+When prompted to either keep the existing certificate or renew and replace it, hit 2 to renew it and then ENTER to confirm your choice.
+
+With the production TLS certificate provisioned, run the Nginx server once again:
+
+docker run --rm --name nginx -p 80:80 -p 443:443 \
+    -v ~/conf/nginx.conf:/etc/nginx/conf.d/nginx.conf:ro \
+    -v /etc/letsencrypt:/etc/letsencrypt \
+    -v /var/lib/letsencrypt:/var/lib/letsencrypt \
+    -v /var/www/html:/var/www/html \
+    nginx:1.19.0
+
+In your browser, navigate to http://your_domain.com. In the URL bar, confirm that the HTTP request has been redirected to HTTPS
+https://your_domain.com/polls
+
+Let’s Encrypt certificates expire every 90 days. To ensure that your certificate remains valid, you should renew it regularly before its scheduled expiry.
+In your terminal, hit CTRL+C to kill the Nginx container. Run it again in detached mode by appending the -d flag:
+docker run --rm --name nginx -d -p 80:80 -p 443:443 \
+    -v ~/conf/nginx.conf:/etc/nginx/conf.d/nginx.conf:ro \
+    -v /etc/letsencrypt:/etc/letsencrypt \
+    -v /var/lib/letsencrypt:/var/lib/letsencrypt \
+  -v /var/www/html:/var/www/html \
+    nginx:1.19.0
+
+ With Nginx running in the background, use the following command to perform a dry run of the certificate renewal procedure:
+
+ docker run -it --rm --name certbot \
+    -v "/etc/letsencrypt:/etc/letsencrypt" \
+  -v "/var/lib/letsencrypt:/var/lib/letsencrypt" \
+  -v "/var/www/html:/var/www/html" \
+  certbot/certbot renew --webroot -w /var/www/html --dry-run
+  
+  if the renewal simulation succeeds, you should see the following output  
+  n a production setting, after renewing certificates, you should reload Nginx so that the changes take effect. To reload Nginx, run the following command:
+
+docker kill -s HUP nginx
+
+the final step is to lock down the setup by preventing external access to the two backend app servers; all HTTP requests should flow through the Nginx proxy.
+Step 5 — Preventing External Access to Django App Servers
+To address this security concern, it’s recommended to use cloud firewalls when working with Docker-enabled servers. 
+ To prevent direct access, we’ll modify UFW’s configuration using the method described in the ufw-docker GitHub repository.
+
+ Begin by logging in to the first Django app server. Then, open the /etc/ufw/after.rules file with superuser privileges, using nano or your favorite editor:
+
+sudo nano /etc/ufw/after.rules
+Enter your password when prompted, and hit ENTER to confirm.
+
+You should see the following ufw rules:
+/etc/ufw/after.rules
+
+#
+# rules.input-after
+#
+# Rules that should be run after the ufw command line added rules. Custom
+# rules should be added to one of these chains:
+#   ufw-after-input
+#   ufw-after-output
+#   ufw-after-forward
+#
+
+# Don't delete these required lines, otherwise there will be errors
+*filter
+:ufw-after-input - [0:0]
+:ufw-after-output - [0:0]
+:ufw-after-forward - [0:0]
+# End required lines
+
+# don't log noisy services by default
+-A ufw-after-input -p udp --dport 137 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 138 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp --dport 139 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp --dport 445 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 67 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 68 -j ufw-skip-to-policy-input
+
+# don't log noisy broadcast
+-A ufw-after-input -m addrtype --dst-type BROADCAST -j ufw-skip-to-policy-input
+
+# don't delete the 'COMMIT' line or these rules won't be processed
+COMMIT
+
+Scroll to the bottom, and paste in the following block of UFW configuration rules:
+/etc/ufw/after.rules
+
+# BEGIN UFW AND DOCKER
+*filter
+:ufw-user-forward - [0:0]
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -j RETURN -s 10.0.0.0/8
+-A DOCKER-USER -j RETURN -s 172.16.0.0/12
+-A DOCKER-USER -j RETURN -s 192.168.0.0/16
+
+-A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
+
+-A DOCKER-USER -j ufw-user-forward
+
+-A DOCKER-USER -j DROP -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
+-A DOCKER-USER -j DROP -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 10.0.0.0/8
+-A DOCKER-USER -j DROP -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 172.16.0.0/12
+-A DOCKER-USER -j DROP -p udp -m udp --dport 0:32767 -d 192.168.0.0/16
+-A DOCKER-USER -j DROP -p udp -m udp --dport 0:32767 -d 10.0.0.0/8
+-A DOCKER-USER -j DROP -p udp -m udp --dport 0:32767 -d 172.16.0.0/12
+
+-A DOCKER-USER -j RETURN
+COMMIT
+# END UFW AND DOCKER
+
+These rules restrict public access to ports opened by Docker, and enable access from the 10.0.0.0/8, 172.16.0.0/12, and 192.168.0.0/16 private IP ranges.
+Restart ufw so that it picks up the new configuration:
+
+sudo systemctl restart ufw
+
+Navigate to http://APP_SERVER_1_IP in your web browser to confirm that you can no longer access the app server over port 80.
+
+Repeat this process on the second Django app server.
+
+Log out of the first app server or open another terminal window, and log in to the second Django app server. Then, open the /etc/ufw/after.rules file with superuser privileges, using nano or your favorite editor:
+
+repeat the above steps
+
+Navigate to http://APP_SERVER_2_IP in your web browser to confirm that you can no longer access the app server over port 80.
+
+inally, navigate to https://your_domain_here/polls 
+
+
+

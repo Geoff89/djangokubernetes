@@ -1,0 +1,394 @@
+How to Set Up an Nginx Ingress with Cert-Manager on DigitalOcean Kubernetes
+
+
+Kubernetes Ingresses allow you to flexibly route traffic from 
+outside your Kubernetes cluster to Services inside of your cluster. 
+This is accomplished using Ingress Resources, which define rules for
+routing HTTP and HTTPS traffic to Kubernetes Services, and Ingress Controllers, which implement the rules by load balancing traffic and routing it to the appropriate backend Services.
+
+Popular Ingress Controllers include Nginx, Contour, HAProxy, and Traefik. 
+Ingresses provide a more efficient and flexible alternative to setting up 
+multiple LoadBalancer services, each of which uses its own dedicated Load 
+Balancer.
+
+Installing nginx kubernetes Controller
+For docker
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v0.47.0/deploy/static/provider/cloud/deploy.yaml
+
+For minikube add ons
+minikube addons enable ingress
+AWS¶
+In AWS we use a Network load balancer (NLB) to expose the NGINX Ingress controller behind a Service of Type=LoadBalancer.
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v0.47.0/deploy/static/provider/aws/deploy.yaml
+
+On many cloud providers ingress-nginx will also create the corresponding Load Balancer resource.
+All you have to do is get the external IP and add a DNS A record inside your DNS provider that point
+myServiceA.foo.org and myServiceB.foo.org to the nginx external IP. Get the external IP by running:
+
+kubectl get services -n ingress-nginx
+
+Step 1 — Setting Up Dummy Backend Services
+nano echo1.yaml
+Then copy
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo1
+spec:
+  ports:
+  - port: 80
+    targetPort: 5678
+  selector:
+    app: echo1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo1
+spec:
+  selector:
+    matchLabels:
+      app: echo1
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: echo1
+    spec:
+      containers:
+      - name: echo1
+        image: hashicorp/http-echo
+        args:
+        - "-text=echo1"
+        ports:
+        - containerPort: 5678
+
+kubectl apply -f echo1.yaml
+kubectl get svc echo1
+
+Create and open a file called echo2.yaml:
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo2
+spec:
+  ports:
+  - port: 80
+    targetPort: 5678
+  selector:
+    app: echo2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo2
+spec:
+  selector:
+    matchLabels:
+      app: echo2
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: echo2
+    spec:
+      containers:
+      - name: echo2
+        image: hashicorp/http-echo
+        args:
+        - "-text=echo2"
+        ports:
+        - containerPort: 5678
+
+kubectl apply -f echo2.yaml
+kubectl get svc
+
+Step 2 — Setting Up the Kubernetes Nginx Ingress Controller
+kubectl get pods -n ingress-nginx \
+  -l app.kubernetes.io/name=ingress-nginx --watch
+Now, confirm that the DigitalOcean Load Balancer was successfully created by fetching the Service details with kubectl:
+kubectl get svc --namespace=ingress-nginx
+
+After several minutes, you should see an external IP address, 
+corresponding to the IP address of the DigitalOcean Load Balancer:
+ Note down the Load Balancer’s external IP address
+
+This load balancer receives traffic on HTTP and HTTPS ports 80 and 443, and forwards it to the 
+Ingress Controller Pod. The Ingress Controller will then route the traffic to the appropriate backend Service.
+
+We can now point our DNS records at this external Load Balancer and create some Ingress Resources 
+to implement traffic routing rules. 
+
+Step 3 — Creating the Ingress Resource
+nano echo_ingress.yaml
+
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: echo-ingress
+spec:
+  rules:
+  - host: echo1.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: echo1
+          servicePort: 80
+  - host: echo2.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: echo2
+          servicePort: 80
+kubectl apply -f echo_ingress.yaml
+
+To test the Ingress, navigate to your DNS management service and create A records for echo1.example.com 
+and echo2.example.com pointing to the DigitalOcean Load Balancer’s external IP. 
+The Load Balancer’s external 
+IP is the external IP address for the ingress-nginx Service, which we fetched in the previous step
+
+Once you’ve created the necessary echo1.example.com and echo2.example.com DNS records, 
+you can test the Ingress Controller and Resource you’ve created using the curl command line utility.
+
+curl echo1.example.com
+Output
+echo1
+curl echo2.example.com
+Output
+echo2
+
+In the next step, we’ll install cert-manager to provision TLS certificates for our Ingress and 
+enable the more secure HTTPS protocol.
+
+Step 4 — Installing and Configuring Cert-Manager
+cert-manager is a Kubernetes add-on that provisions TLS certificates from Let’s Encrypt and 
+other certificate authorities (CAs) and manages their lifecycles
+
+Certificates can be automatically requested and configured by annotating Ingress Resources,
+appending a tls section to the Ingress spec, and configuring one or more Issuers or
+ClusterIssuers to specify your preferred certificate authority. 
+
+install cert-manager and its Custom Resource Definitions (CRDs) like Issuers and ClusterIssuers
+by following the official installation instructions. 
+
+namespace cert-manager will be installed
+
+kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v0.16.1/cert-manager.yaml
+
+kubectl get pods --namespace cert-manager
+
+Before we begin issuing certificates for our echo1.example.com and echo2.example.com domains, 
+we need to create an Issuer, which specifies the certificate
+authority from which signed x509 certificates can be obtained
+Let’s Encrypt certificate authority, which provides free TLS certificates and offers both a 
+staging server for testing your certificate configuration, and a production server 
+for rolling out verifiable TLS certificates.
+
+Let’s create a test ClusterIssuer to make sure the certificate provisioning mechanism is 
+functioning correctly. A ClusterIssuer is not namespace-scoped and can be used by Certificate 
+resources in any namespace.
+
+nano staging_issuer.yaml
+apiVersion: cert-manager.io/v1alpha2
+kind: ClusterIssuer
+metadata:
+ name: letsencrypt-staging
+ namespace: cert-manager
+spec:
+ acme:
+   # The ACME server URL
+   server: https://acme-staging-v02.api.letsencrypt.org/directory
+   # Email address used for ACME registration
+   email: your_email_address_here
+   # Name of a secret used to store the ACME account private key
+   privateKeySecretRef:
+     name: letsencrypt-staging
+   # Enable the HTTP-01 challenge provider
+   solvers:
+   - http01:
+       ingress:
+         class:  nginx
+
+kubectl create -f staging_issuer.yaml
+We’ll now repeat this process to create the production ClusterIssuer. 
+Note that certificates will only be created 
+after annotating and updating the Ingress resource provisioned in the previous step.
+
+nano prod_issuer.yaml
+apiVersion: cert-manager.io/v1alpha2
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+  namespace: cert-manager
+spec:
+  acme:
+    # The ACME server URL
+    server: https://acme-v02.api.letsencrypt.org/directory
+    # Email address used for ACME registration
+    email: your_email_address_here
+    # Name of a secret used to store the ACME account private key
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    # Enable the HTTP-01 challenge provider
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+kubectl create -f prod_issuer.yaml
+
+Now that we’ve created our Let’s Encrypt staging and prod ClusterIssuers, we’re ready to modify the Ingress Resource we created above and enable 
+TLS encryption for the echo1.example.com and echo2.example.com
+
+If you’re using DigitalOcean Kubernetes, you first need to implement a workaround so that Pods 
+can communicate with other Pods using the Ingress. 
+If you’re not using DigitalOcean Kubernetes, you can skip ahead to Step 6
+
+Step 5 — Enabling Pod Communication through the Load Balancer (optional)
+Before it provisions certificates from Let’s Encrypt, cert-manager first performs a self-check 
+to ensure that Let’s Encrypt can reach the cert-manager Pod that validates your domain. 
+For this check to pass on DigitalOcean Kubernetes, 
+you need to enable Pod-Pod communication through the Nginx Ingress load balancer
+
+To do this, we’ll create a DNS A record that points to the external IP of the cloud load balancer, 
+and annotate the Nginx Ingress Service manifest 
+with this subdomain.
+Begin by navigating to your DNS management service and create an A record for workaround.example.com 
+pointing to the DigitalOcean Load Balancer’s external IP
+nano ingress_nginx_svc.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    service.beta.kubernetes.io/do-loadbalancer-enable-proxy-protocol: 'true'
+    service.beta.kubernetes.io/do-loadbalancer-hostname: "workaround.example.com"
+  labels:
+    helm.sh/chart: ingress-nginx-2.11.1
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.34.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: http
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: https
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+
+Modify the running ingress-nginx-controller Service using kubectl apply:  
+Step 6 — Issuing Staging and Production Let’s Encrypt Certificates
+
+To issue a staging TLS certificate for our domains, we’ll annotate echo_ingress.yaml with the ClusterIssuer created in Step 4
+
+nano echo_ingress.yaml
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: echo-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+spec:
+  tls:
+  - hosts:
+    - echo1.example.com
+    - echo2.example.com
+    secretName: echo-tls
+  rules:
+  - host: echo1.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: echo1
+          servicePort: 80
+  - host: echo2.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: echo2
+          servicePort: 80
+
+kubectl apply -f echo_ingress.yaml
+kubectl describe ingress
+
+This confirms that the TLS certificate was successfully issued and HTTPS encryption 
+is now active for the two domains configured.
+We’re now ready to send a request to a backend echo server to test that HTTPS is functioning correctly.
+
+wget --save-headers -O- echo1.example.com
+This indicates that HTTPS has successfully been enabled, but the certificate 
+cannot be verified as it’s a fake temporary certificate issued by the Let’s Encrypt staging server.
+
+Update echo_ingress.yaml to use letsencrypt-prod:
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: echo-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - echo1.example.com
+    - echo2.example.com
+    secretName: echo-tls
+  rules:
+  - host: echo1.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: echo1
+          servicePort: 80
+  - host: echo2.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: echo2
+          servicePort: 80
+
+kubectl apply -f echo_ingress.yaml
+We’ll now perform a test using curl to verify that HTTPS is working correctly
+
+curl echo1.example.com
+ouptut will be
+<html>
+<head><title>308 Permanent Redirect</title></head>
+<body>
+<center><h1>308 Permanent Redirect</h1></center>
+<hr><center>nginx/1.15.9</center>
+</body>
+</html>
+
+curl https://echo1.example.com
+Output
+echo1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

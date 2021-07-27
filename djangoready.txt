@@ -1,0 +1,167 @@
+FROM python:3.7-slim
+
+# Create a group and user to run our app
+ARG APP_USER=appuser
+RUN groupadd -r ${APP_USER} && useradd --no-log-init -r -g ${APP_USER} ${APP_USER}
+
+# Install packages needed to run your application (not build deps):
+#   mime-support -- for mime types when serving static files
+#   postgresql-client -- for running database commands
+# We need to recreate the /usr/share/man/man{1..8} directories first because
+# they were clobbered by a parent image.
+RUN set -ex \
+    && RUN_DEPS=" \
+    libpcre3 \
+    mime-support \
+    postgresql-client \
+    " \
+    && seq 1 8 | xargs -I{} mkdir -p /usr/share/man/man{} \
+    && apt-get update && apt-get install -y --no-install-recommends $RUN_DEPS \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy in your requirements file
+ADD requirements.txt /requirements.txt
+
+# OR, if you're using a directory for your requirements, copy everything (comment out the above and uncomment this if so):
+# ADD requirements /requirements
+
+# Install build deps, then run `pip install`, then remove unneeded build deps all in a single step.
+# Correct the path to your production requirements file, if needed.
+RUN set -ex \
+    && BUILD_DEPS=" \
+    build-essential \
+    libpcre3-dev \
+    libpq-dev \
+    " \
+    && apt-get update && apt-get install -y --no-install-recommends $BUILD_DEPS \
+    && pip install --no-cache-dir -r /requirements.txt \
+    \
+    && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false $BUILD_DEPS \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy your application code to the container (make sure you create a .dockerignore file if any large files or directories should be excluded)
+RUN mkdir /code/
+WORKDIR /code/
+ADD . /code/
+
+# uWSGI will listen on this port
+EXPOSE 8000
+
+# Add any static environment variables needed by Django or your settings file here:
+ENV DJANGO_SETTINGS_MODULE=my_project.settings.deploy
+
+# Call collectstatic (customize the following line with the minimal environment variables needed for manage.py to run):
+RUN DATABASE_URL='' python manage.py collectstatic --noinput
+
+# Tell uWSGI where to find your wsgi file (change this):
+ENV UWSGI_WSGI_FILE=my_project/wsgi.py
+
+# Base uWSGI configuration (you shouldn't need to change these):
+ENV UWSGI_HTTP=:8000 UWSGI_MASTER=1 UWSGI_HTTP_AUTO_CHUNKED=1 UWSGI_HTTP_KEEPALIVE=1 UWSGI_LAZY_APPS=1 UWSGI_WSGI_ENV_BEHAVIOR=holy
+
+# Number of uWSGI workers and threads per worker (customize as needed):
+ENV UWSGI_WORKERS=2 UWSGI_THREADS=4
+
+# uWSGI static file serving configuration (customize or comment out if not needed):
+ENV UWSGI_STATIC_MAP="/static/=/code/static/" UWSGI_STATIC_EXPIRES_URI="/static/.*\.[a-f0-9]{12,}\.(css|js|png|jpg|jpeg|gif|ico|woff|ttf|otf|svg|scss|map|txt) 315360000"
+
+# Deny invalid hosts before they get to Django (uncomment and change to your hostname(s)):
+# ENV UWSGI_ROUTE_HOST="^(?!localhost:8000$) break:400"
+
+# Change to a non-root user
+USER ${APP_USER}:${APP_USER}
+
+# Uncomment after creating your docker-entrypoint.sh
+# ENTRYPOINT ["/code/docker-entrypoint.sh"]
+
+# Start uWSGI
+CMD ["uwsgi", "--show-config"]
+
+the above is a docker file written by caktus  blog
+in requirements.txt copy
+Django>=2.2,<2.3
+uwsgi>=2.0,<2.1
+dj-database-url>=0.5,<0.6
+psycopg2>=2.8,<2.9
+
+deploy.py copy
+import os
+
+import dj_database_url
+
+from . import *  # noqa: F403
+
+# This is NOT a complete production settings file. For more, see:
+# See https://docs.djangoproject.com/en/dev/howto/deployment/checklist/
+
+DEBUG = False
+
+ALLOWED_HOSTS = ['localhost']
+
+DATABASES['default'] = dj_database_url.config(conn_max_age=600)  # noqa: F405
+
+STATIC_ROOT = os.path.join(BASE_DIR, 'static')  # noqa: F405
+
+STATICFILES_STORAGE = 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
+
+---
+Building and Testing the Container
+docker build -t my-app .
+
+docker run -e DATABASE_URL='' -t my-app
+This command is merely a smoke test to make sure uWSGI runs, and won't connect to a 
+database or any other external services.
+
+Running Commands During Container Start-Up
+docker-entrypoint.sh in the same directory as your Dockerfile:
+
+#!/bin/sh
+set -e
+
+until psql $DATABASE_URL -c '\l'; do
+    >&2 echo "Postgres is unavailable - sleeping"
+    sleep 1
+done
+
+>&2 echo "Postgres is up - continuing"
+
+if [ "x$DJANGO_MANAGEPY_MIGRATE" = 'xon' ]; then
+    python manage.py migrate --noinput
+fi
+
+exec "$@"
+
+chmod a+x docker-entrypoint.sh
+ENTRYPOINT ["/code/docker-entrypoint.sh"] --uncomment the above line
+
+Creating a Production-Like Environment Locally with Docker Compose
+
+version: "2"
+
+services:
+  db:
+    environment:
+      POSTGRES_DB: app_db
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: changeme
+    restart: always
+    image: postgres:12
+    expose:
+      - "5432"
+  app:
+    environment:
+      DATABASE_URL: postgres://app_user:changeme@db/app_db
+      DJANGO_MANAGEPY_MIGRATE: "on"
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    links:
+      - db:db
+    ports:
+      - "8000:8000"
+
+ docker-compose up --build -d
+ docker-compose logs
+
+ http://localhost:8000/ in a web browser.
+ docker-compose run app /bin/bash     

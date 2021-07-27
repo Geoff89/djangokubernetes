@@ -1,0 +1,206 @@
+#prerequisites
+1. Ensure you have a ec2 instance, s3 and rds with postgres
+
+Step 1 — Creating the PostgreSQL Database and User
+Install postgres client in ec2
+sudo apt update
+sudo apt install postgresql-client
+
+-Grab the rds credentials host, password, databasename and fill the below
+psql -U username -h host -p port -d database --set=sslmode=require
+telnet rdsendpoint 5432
+CREATE DATABASE polls;
+\c polls;
+CREATE USER sammy WITH PASSWORD 'password';
+
+--We’ll now modify a few of the connection parameters for the user we just created.
+ This will speed up database operations so that the correct values do not have to be 
+ queried and set each time a connection is established.
+
+ALTER ROLE sammy SET client_encoding TO 'utf8';
+ALTER ROLE sammy SET default_transaction_isolation TO 'read committed';
+ALTER ROLE sammy SET timezone TO 'UTC';
+
+GRANT ALL PRIVILEGES ON DATABASE polls TO sammy;
+
+\q
+Step 2 — Cloning App Repository and Declaring Dependencies
+
+mkdir polls-project
+cd polls-project
+git clone https://github.com/do-community/django-polls.git
+
+--create a requirements.txt file and copy the necessary packages to install
+use the 12 factor mechanism by usiing os.getenv
+We can use Python’s getenv function in the os module to configure Django to read 
+configuration parameters from local environment variables instead
+in settings.py
+
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
+DEBUG = os.getenv('DEBUG', False)
+ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', '127.0.0.1').split(',')
+
+# Database
+# https://docs.djangoproject.com/en/2.1/ref/settings/#databases
+
+DATABASES = {
+     'default': {
+         'ENGINE': 'django.db.backends.{}'.format(
+             os.getenv('DATABASE_ENGINE', '.postgresql')
+         ),
+         'NAME': os.getenv('DATABASE_NAME', 'polls'),
+         'USER': os.getenv('DATABASE_USERNAME', 'myprojectuser'),
+         'PASSWORD': os.getenv('DATABASE_PASSWORD', 'password'),
+         'HOST': os.getenv('DATABASE_HOST', '127.0.0.1'),
+         'PORT': os.getenv('DATABASE_PORT', 5432),
+         'OPTIONS': json.loads(
+             os.getenv('DATABASE_OPTIONS', '{}')
+         ),
+     }
+
+ Step 4 — Offloading Static Assets    
+ add django-storages as storages in settings.py
+ INSTALLED_APPS = [
+    . . .
+    'django.contrib.staticfiles',
+    'storages',
+]
+-add the following in settings.py
+
+. . .
+
+# Static files (CSS, JavaScript, Images)
+# https://docs.djangoproject.com/en/2.1/howto/static-files/
+
+# Moving static assets to DigitalOcean Spaces as per:
+# https://www.digitalocean.com/community/tutorials/how-to-set-up-object-storage-with-django
+AWS_ACCESS_KEY_ID = os.getenv('STATIC_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('STATIC_SECRET_KEY')
+
+AWS_STORAGE_BUCKET_NAME = os.getenv('STATIC_BUCKET_NAME')
+AWS_S3_ENDPOINT_URL = os.getenv('STATIC_ENDPOINT_URL')
+AWS_S3_OBJECT_PARAMETERS = {
+    'CacheControl': 'max-age=86400',
+}
+AWS_LOCATION = 'static'
+AWS_DEFAULT_ACL = 'public-read'
+
+STATICFILES_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
+
+STATIC_URL = '{}/{}/'.format(AWS_S3_ENDPOINT_URL, AWS_LOCATION)
+STATIC_ROOT = 'static/'
+
+AWS_LOCATION: Defines a directory called static within the object
+storage bucket where all static files will be placed.
+when you run manage.py collectstatic to assemble your project’s static files,
+Django will upload these to remote object storage 
+
+Step 5 — Configuring Logging in settings.py
+import json
+import os
+import logging.config
+. . .
+. . .
+# Logging Configuration
+
+# Clear prev config
+LOGGING_CONFIG = None
+
+# Get loglevel from env
+LOGLEVEL = os.getenv('DJANGO_LOGLEVEL', 'info').upper()
+
+logging.config.dictConfig({
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'console': {
+            'format': '%(asctime)s %(levelname)s [%(name)s:%(lineno)s] %(module)s %(process)d %(thread)d %(message)s',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'console',
+        },
+    },
+    'loggers': {
+        '': {
+            'level': LOGLEVEL,
+            'handlers': ['console',],
+        },
+    },
+})
+Step 6 — Writing the Application Dockerfile
+First, navigate out of the django-polls directory.
+cd ..
+--the dockefile looks as follows
+FROM python:3.7.4-alpine3.10
+
+ADD django-polls/requirements.txt /app/requirements.txt
+
+RUN set -ex \
+    && apk add --no-cache --virtual .build-deps postgresql-dev build-base \
+    && python -m venv /env \
+    && /env/bin/pip install --upgrade pip \
+    && /env/bin/pip install --no-cache-dir -r /app/requirements.txt \
+    && runDeps="$(scanelf --needed --nobanner --recursive /env \
+        | awk '{ gsub(/,/, "\nso:", $2); print "so:" $2 }' \
+        | sort -u \
+        | xargs -r apk info --installed \
+        | sort -u)" \
+    && apk add --virtual rundeps $runDeps \
+    && apk del .build-deps
+
+ADD django-polls /app
+WORKDIR /app
+
+ENV VIRTUAL_ENV /env
+ENV PATH /env/bin:$PATH
+
+EXPOSE 8000
+
+CMD ["gunicorn", "--bind", ":8000", "--workers", "3", "mysite.wsgi:application"]
+
+docker build -t django-polls:v0 .
+However, the run command will most likely fail here as we still haven’t configured
+the container’s running environment. Externalized variables like SECRET_KEY and
+database settings from settings.py will be either blank or set to default values.
+
+Create a file called env in the polls-project directory, and paste in the following list of variables:
+polls-project/env
+
+DJANGO_SECRET_KEY=your_secret_key
+DEBUG=True
+DJANGO_ALLOWED_HOSTS=your_server_IP_address
+DATABASE_ENGINE=postgresql_psycopg2
+DATABASE_NAME=polls
+DATABASE_USERNAME=sammy
+DATABASE_PASSWORD=your_database_password
+DATABASE_HOST=your_database_host
+DATABASE_PORT=your_database_port
+STATIC_ACCESS_KEY_ID=your_space_access_key_id
+STATIC_SECRET_KEY=your_space_secret_key
+STATIC_BUCKET_NAME=your_space_name
+STATIC_ENDPOINT_URL=https://nyc3.digitaloceanspaces.com
+DJANGO_LOGLEVEL=info
+
+docker run --env-file env django-polls:v0 sh -c "python manage.py makemigrations && python manage.py migrate"
+docker run -i -t --env-file env django-polls:v0 sh
+python manage.py createsuperuser
+
+Finally, we’ll generate the static files for the app and upload them to the DigitalOcean 
+Space using collectstatic:
+
+docker run --env-file env django-polls:v0 sh -c "python manage.py collectstatic --noinput"
+docker run --env-file env -p 80:8000 django-polls:v0
+http://your_server_ip/polls
+http://your_server_ip/admin
+
+
+Finally, now that you’ve fully containerized the Django Polls app, you can push
+the image to a container registry like Dockerhub 
+and make it available to any system where Docker is available
+
+
+
+
